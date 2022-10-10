@@ -404,6 +404,7 @@ DtlsTransport::DtlsTransport(shared_ptr<IceTransport> lower, certificate_ptr cer
 		SSL_CTX_set_options(mCtx, SSL_OP_NO_SSLv3 | SSL_OP_NO_COMPRESSION | SSL_OP_NO_QUERY_MTU |
 		                              SSL_OP_NO_RENEGOTIATION);
 
+		SSL_CTX_set1_sigalgs_list(mCtx, "ecdsa_secp256r1_sha256:rsa_pkcs1_sha256:rsa_pss_pss_sha256");
 		SSL_CTX_set_min_proto_version(mCtx, DTLS1_VERSION);
 		SSL_CTX_set_read_ahead(mCtx, 1);
 		SSL_CTX_set_quiet_shutdown(mCtx, 1);
