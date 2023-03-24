@@ -1,19 +1,9 @@
 /**
  * Copyright (c) 2020-2022 Paul-Louis Ageneau
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 #include "init.hpp"
@@ -21,9 +11,9 @@
 
 #include "certificate.hpp"
 #include "dtlstransport.hpp"
+#include "icetransport.hpp"
 #include "pollservice.hpp"
 #include "sctptransport.hpp"
-#include "icetransport.hpp"
 #include "threadpool.hpp"
 #include "tls.hpp"
 
@@ -38,6 +28,8 @@
 #ifdef _WIN32
 #include <winsock2.h>
 #endif
+
+#include <thread>
 
 namespace rtc::impl {
 
@@ -125,7 +117,11 @@ void Init::doInit() {
 		throw std::runtime_error("WSAStartup failed, error=" + std::to_string(WSAGetLastError()));
 #endif
 
-	ThreadPool::Instance().spawn(THREADPOOL_SIZE);
+	int concurrency = std::thread::hardware_concurrency();
+	int count = std::max(concurrency, MIN_THREADPOOL_SIZE);
+	PLOG_DEBUG << "Spawning " << count << " threads";
+	ThreadPool::Instance().spawn(count);
+
 #if RTC_ENABLE_WEBSOCKET
 	PollService::Instance().start();
 #endif
@@ -145,6 +141,7 @@ void Init::doInit() {
 #if RTC_ENABLE_MEDIA
 	DtlsSrtpTransport::Init();
 #endif
+	IceTransport::Init();
 }
 
 void Init::doCleanup() {
@@ -158,6 +155,7 @@ void Init::doCleanup() {
 	PLOG_DEBUG << "Global cleanup";
 
 	ThreadPool::Instance().join();
+	ThreadPool::Instance().clear();
 #if RTC_ENABLE_WEBSOCKET
 	PollService::Instance().join();
 #endif
@@ -170,6 +168,7 @@ void Init::doCleanup() {
 #if RTC_ENABLE_MEDIA
 	DtlsSrtpTransport::Cleanup();
 #endif
+	IceTransport::Cleanup();
 
 #ifdef _WIN32
 	WSACleanup();

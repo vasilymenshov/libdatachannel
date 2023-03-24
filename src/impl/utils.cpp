@@ -1,29 +1,22 @@
 /**
  * Copyright (c) 2020-2022 Paul-Louis Ageneau
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 #include "utils.hpp"
 
 #include "impl/internals.hpp"
 
+#include <algorithm>
 #include <cctype>
+#include <chrono>
 #include <functional>
 #include <iterator>
 #include <sstream>
+#include <thread>
 
 namespace rtc::impl::utils {
 
@@ -108,6 +101,70 @@ string base64_encode(const binary &data) {
 	}
 
 	return out;
+}
+
+std::seed_seq random_seed() {
+	std::vector<unsigned int> seed;
+
+	// Seed with random device
+	try {
+		// On some systems an exception might be thrown if the random_device can't be initialized
+		std::random_device device;
+		// 128 bits should be more than enough
+		std::generate_n(std::back_inserter(seed), 4, std::ref(device));
+	} catch (...) {
+		// Ignore
+	}
+
+	// Seed with high-resolution clock
+	using std::chrono::high_resolution_clock;
+	seed.push_back(
+	    static_cast<unsigned int>(high_resolution_clock::now().time_since_epoch().count()));
+
+	// Seed with thread id
+	seed.push_back(
+	    static_cast<unsigned int>(std::hash<std::thread::id>{}(std::this_thread::get_id())));
+
+	return std::seed_seq(seed.begin(), seed.end());
+}
+
+size_t parseHttpLines(const byte *buffer, size_t size, std::list<string> &lines) {
+	lines.clear();
+	auto begin = reinterpret_cast<const char *>(buffer);
+	auto end = begin + size;
+	auto cur = begin;
+	while (true) {
+		auto last = cur;
+		cur = std::find(cur, end, '\n');
+		if (cur == end)
+			return 0;
+		string line(last, cur != begin && *std::prev(cur) == '\r' ? std::prev(cur++) : cur++);
+		if (line.empty())
+			break;
+		lines.emplace_back(std::move(line));
+	}
+
+	return cur - begin;
+}
+
+std::multimap<string, string> parseHttpHeaders(const std::list<string> &lines) {
+	std::multimap<string, string> headers;
+	for (const auto &line : lines) {
+		if (size_t pos = line.find_first_of(':'); pos != string::npos) {
+			string key = line.substr(0, pos);
+			string value = "";
+			if (size_t subPos = line.find_first_not_of(' ', pos + 1); subPos != string::npos) {
+				value = line.substr(subPos);
+			}
+			std::transform(key.begin(), key.end(), key.begin(),
+			               [](char c) { return std::tolower(c); });
+			headers.emplace(std::move(key), std::move(value));
+		} else {
+			headers.emplace(line, "");
+		}
+	}
+
+	return headers;
 }
 
 } // namespace rtc::impl::utils

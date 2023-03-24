@@ -1,25 +1,16 @@
 /**
  * Copyright (c) 2019-2020 Paul-Louis Ageneau
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 #include "icetransport.hpp"
 #include "configuration.hpp"
 #include "internals.hpp"
 #include "transport.hpp"
+#include "utils.hpp"
 
 #include <iostream>
 #include <random>
@@ -45,6 +36,14 @@ namespace rtc::impl {
 #if !USE_NICE // libjuice
 
 const int MAX_TURN_SERVERS_COUNT = 2;
+
+void IceTransport::Init() {
+	// Dummy
+}
+
+void IceTransport::Cleanup() {
+	// Dummy
+}
 
 IceTransport::IceTransport(const Configuration &config, candidate_callback candidateCallback,
                            state_callback stateChangeCallback,
@@ -103,8 +102,7 @@ IceTransport::IceTransport(const Configuration &config, candidate_callback candi
 
 	// Randomize servers order
 	std::vector<IceServer> servers = config.iceServers;
-	auto seed = static_cast<unsigned int>(system_clock::now().time_since_epoch().count());
-	std::shuffle(servers.begin(), servers.end(), std::default_random_engine(seed));
+	std::shuffle(servers.begin(), servers.end(), utils::random_engine());
 
 	// Pick a STUN server
 	for (auto &server : servers) {
@@ -158,11 +156,9 @@ IceTransport::IceTransport(const Configuration &config, candidate_callback candi
 }
 
 IceTransport::~IceTransport() {
-	stop();
+	PLOG_DEBUG << "Destroying ICE transport";
 	mAgent.reset();
 }
-
-bool IceTransport::stop() { return Transport::stop(); }
 
 Description::Role IceTransport::role() const { return mRole; }
 
@@ -181,9 +177,21 @@ Description IceTransport::getLocalDescription(Description::Type type) const {
 }
 
 void IceTransport::setRemoteDescription(const Description &description) {
+	// RFC 5763: The answerer MUST use either a setup attribute value of setup:active or
+	// setup:passive.
+	// See https://www.rfc-editor.org/rfc/rfc5763.html#section-5
+	if (description.type() == Description::Type::Answer &&
+	    description.role() == Description::Role::ActPass)
+		throw std::logic_error("Illegal role actpass in remote answer description");
+
+	// RFC 5763: Note that if the answerer uses setup:passive, then the DTLS handshake
+	// will not begin until the answerer is received, which adds additional latency.
+	// setup:active allows the answer and the DTLS handshake to occur in parallel. Thus,
+	// setup:active is RECOMMENDED.
 	if (mRole == Description::Role::ActPass)
 		mRole = description.role() == Description::Role::Active ? Description::Role::Passive
 		                                                        : Description::Role::Active;
+
 	if (mRole == description.role())
 		throw std::logic_error("Incompatible roles with remote description");
 
@@ -356,6 +364,38 @@ void IceTransport::LogCallback(juice_log_level_t level, const char *message) {
 
 #else // USE_NICE == 1
 
+unique_ptr<GMainLoop, void (*)(GMainLoop *)> IceTransport::MainLoop(nullptr, nullptr);
+std::thread IceTransport::MainLoopThread;
+
+void IceTransport::Init() {
+	g_log_set_handler("libnice", G_LOG_LEVEL_MASK, LogCallback, nullptr);
+
+	IF_PLOG(plog::verbose) {
+		nice_debug_enable(false); // do not output STUN debug messages
+	}
+
+	MainLoop = decltype(MainLoop)(g_main_loop_new(nullptr, FALSE), g_main_loop_unref);
+	if (!MainLoop)
+		throw std::runtime_error("Failed to create the main loop");
+
+	MainLoopThread = std::thread(g_main_loop_run, MainLoop.get());
+}
+
+void IceTransport::Cleanup() {
+	g_main_loop_quit(MainLoop.get());
+	MainLoopThread.join();
+	MainLoop.reset();
+}
+
+static void closeNiceAgentCallback(GObject *niceAgent, GAsyncResult *, gpointer) {
+	g_object_unref(niceAgent);
+}
+
+static void closeNiceAgent(NiceAgent *niceAgent) {
+	// close the agent to prune alive TURN refreshes, before releasing it
+	nice_agent_close_async(niceAgent, closeNiceAgentCallback, nullptr);
+}
+
 IceTransport::IceTransport(const Configuration &config, candidate_callback candidateCallback,
                            state_callback stateChangeCallback,
                            gathering_state_callback gatheringStateChangeCallback)
@@ -363,19 +403,12 @@ IceTransport::IceTransport(const Configuration &config, candidate_callback candi
       mMid("0"), mGatheringState(GatheringState::New),
       mCandidateCallback(std::move(candidateCallback)),
       mGatheringStateChangeCallback(std::move(gatheringStateChangeCallback)),
-      mNiceAgent(nullptr, nullptr), mMainLoop(nullptr, nullptr), mOutgoingDscp(0) {
+      mNiceAgent(nullptr, nullptr), mOutgoingDscp(0) {
 
 	PLOG_DEBUG << "Initializing ICE transport (libnice)";
 
-	g_log_set_handler("libnice", G_LOG_LEVEL_MASK, LogCallback, this);
-
-	IF_PLOG(plog::verbose) {
-		nice_debug_enable(false); // do not output STUN debug messages
-	}
-
-	mMainLoop = decltype(mMainLoop)(g_main_loop_new(nullptr, FALSE), g_main_loop_unref);
-	if (!mMainLoop)
-		std::runtime_error("Failed to create the main loop");
+	if(!MainLoop)
+		throw std::logic_error("Main loop for nice agent is not created");
 
 	// RFC 8445: The nomination process that was referred to as "aggressive nomination" in RFC 5245
 	// has been deprecated in this specification.
@@ -386,15 +419,13 @@ IceTransport::IceTransport(const Configuration &config, candidate_callback candi
 	// Create agent
 	mNiceAgent = decltype(mNiceAgent)(
 	    nice_agent_new_full(
-	        g_main_loop_get_context(mMainLoop.get()),
+	        g_main_loop_get_context(MainLoop.get()),
 	        NICE_COMPATIBILITY_RFC5245, // RFC 5245 was obsoleted by RFC 8445 but this should be OK
 	        flags),
-	    g_object_unref);
+	    closeNiceAgent);
 
 	if (!mNiceAgent)
 		throw std::runtime_error("Failed to create the nice agent");
-
-	mMainLoopThread = std::thread(g_main_loop_run, mMainLoop.get());
 
 	mStreamId = nice_agent_add_stream(mNiceAgent.get(), 1);
 	if (!mStreamId)
@@ -453,8 +484,7 @@ IceTransport::IceTransport(const Configuration &config, candidate_callback candi
 
 	// Randomize order
 	std::vector<IceServer> servers = config.iceServers;
-	auto seed = static_cast<unsigned int>(system_clock::now().time_since_epoch().count());
-	std::shuffle(servers.begin(), servers.end(), std::default_random_engine(seed));
+	std::shuffle(servers.begin(), servers.end(), utils::random_engine());
 
 	// Add one STUN server
 	bool success = false;
@@ -568,28 +598,21 @@ IceTransport::IceTransport(const Configuration &config, candidate_callback candi
 	nice_agent_set_port_range(mNiceAgent.get(), mStreamId, 1, config.portRangeBegin,
 	                          config.portRangeEnd);
 
-	nice_agent_attach_recv(mNiceAgent.get(), mStreamId, 1, g_main_loop_get_context(mMainLoop.get()),
+	nice_agent_attach_recv(mNiceAgent.get(), mStreamId, 1, g_main_loop_get_context(MainLoop.get()),
 	                       RecvCallback, this);
 }
 
-IceTransport::~IceTransport() { stop(); }
-
-bool IceTransport::stop() {
+IceTransport::~IceTransport() {
 	if (mTimeoutId) {
 		g_source_remove(mTimeoutId);
 		mTimeoutId = 0;
 	}
 
-	if (!Transport::stop())
-		return false;
-
-	PLOG_DEBUG << "Stopping ICE thread";
-	nice_agent_attach_recv(mNiceAgent.get(), mStreamId, 1, g_main_loop_get_context(mMainLoop.get()),
+	PLOG_DEBUG << "Destroying ICE transport";
+	nice_agent_attach_recv(mNiceAgent.get(), mStreamId, 1, g_main_loop_get_context(MainLoop.get()),
 	                       NULL, NULL);
 	nice_agent_remove_stream(mNiceAgent.get(), mStreamId);
-	g_main_loop_quit(mMainLoop.get());
-	mMainLoopThread.join();
-	return true;
+	mNiceAgent.reset();
 }
 
 Description::Role IceTransport::role() const { return mRole; }
@@ -613,9 +636,21 @@ Description IceTransport::getLocalDescription(Description::Type type) const {
 }
 
 void IceTransport::setRemoteDescription(const Description &description) {
+	// RFC 5763: The answerer MUST use either a setup attribute value of setup:active or
+	// setup:passive.
+	// See https://www.rfc-editor.org/rfc/rfc5763.html#section-5
+	if (description.type() == Description::Type::Answer &&
+	    description.role() == Description::Role::ActPass)
+		throw std::logic_error("Illegal role actpass in remote answer description");
+
+	// RFC 5763: Note that if the answerer uses setup:passive, then the DTLS handshake
+	// will not begin until the answerer is received, which adds additional latency.
+	// setup:active allows the answer and the DTLS handshake to occur in parallel. Thus,
+	// setup:active is RECOMMENDED.
 	if (mRole == Description::Role::ActPass)
 		mRole = description.role() == Description::Role::Active ? Description::Role::Passive
 		                                                        : Description::Role::Active;
+
 	if (mRole == description.role())
 		throw std::logic_error("Incompatible roles with remote description");
 

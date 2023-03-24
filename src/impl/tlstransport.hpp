@@ -1,19 +1,9 @@
 /**
  * Copyright (c) 2020 Paul-Louis Ageneau
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 #ifndef RTC_IMPL_TLS_TRANSPORT_H
@@ -33,18 +23,19 @@
 namespace rtc::impl {
 
 class TcpTransport;
+class HttpProxyTransport;
 
-class TlsTransport : public Transport {
+class TlsTransport : public Transport, public std::enable_shared_from_this<TlsTransport> {
 public:
 	static void Init();
 	static void Cleanup();
 
-	TlsTransport(shared_ptr<TcpTransport> lower, optional<string> host, certificate_ptr certificate,
-	             state_callback callback);
+	TlsTransport(variant<shared_ptr<TcpTransport>, shared_ptr<HttpProxyTransport>> lower,
+	             optional<string> host, certificate_ptr certificate, state_callback callback);
 	virtual ~TlsTransport();
 
 	void start() override;
-	bool stop() override;
+	void stop() override;
 	bool send(message_ptr message) override;
 
 	bool isClient() const { return mIsClient; }
@@ -53,13 +44,16 @@ protected:
 	virtual void incoming(message_ptr message) override;
 	virtual bool outgoing(message_ptr message) override;
 	virtual void postHandshake();
-	void runRecvLoop();
+
+	void enqueueRecv();
+	void doRecv();
 
 	const optional<string> mHost;
 	const bool mIsClient;
 
 	Queue<message_ptr> mIncomingQueue;
-	std::thread mRecvThread;
+	std::atomic<int> mPendingRecvCount = 0;
+	std::mutex mRecvMutex;
 
 #if USE_GNUTLS
 	gnutls_session_t mSession;
@@ -76,10 +70,19 @@ protected:
 	SSL *mSsl;
 	BIO *mInBio, *mOutBio;
 
+	bool flushOutput();
+
+	static BIO_METHOD *BioMethods;
 	static int TransportExIndex;
+	static std::mutex GlobalMutex;
 
 	static int CertificateCallback(int preverify_ok, X509_STORE_CTX *ctx);
 	static void InfoCallback(const SSL *ssl, int where, int ret);
+
+	static int BioMethodNew(BIO *bio);
+	static int BioMethodFree(BIO *bio);
+	static int BioMethodWrite(BIO *bio, const char *in, int inl);
+	static long BioMethodCtrl(BIO *bio, int cmd, long num, void *ptr);
 #endif
 };
 

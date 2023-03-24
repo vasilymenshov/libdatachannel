@@ -1,19 +1,9 @@
 /**
  * Copyright (c) 2019 Paul-Louis Ageneau
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 #include <chrono>
@@ -57,6 +47,9 @@ int main(int argc, char **argv) {
 		cerr << "WebRTC connectivity test failed: " << e.what() << endl;
 		return -1;
 	}
+
+// TODO: Temporarily disabled as the Open Relay TURN server is unreliable
+/*
 	try {
 		cout << endl << "*** Running WebRTC TURN connectivity test..." << endl;
 		test_turn_connectivity();
@@ -65,6 +58,7 @@ int main(int argc, char **argv) {
 		cerr << "WebRTC TURN connectivity test failed: " << e.what() << endl;
 		return -1;
 	}
+*/
 	try {
 		cout << endl << "*** Running WebRTC negotiated DataChannel test..." << endl;
 		test_negotiated();

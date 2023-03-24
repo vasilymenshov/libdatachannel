@@ -1,19 +1,9 @@
 /**
  * Copyright (c) 2019-2021 Paul-Louis Ageneau
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 #ifndef RTC_IMPL_PEER_CONNECTION_H
@@ -46,6 +36,7 @@ struct PeerConnection : std::enable_shared_from_this<PeerConnection> {
 	~PeerConnection();
 
 	void close();
+	void remoteClose();
 
 	optional<Description> localDescription() const;
 	optional<Description> remoteDescription() const;
@@ -77,7 +68,6 @@ struct PeerConnection : std::enable_shared_from_this<PeerConnection> {
 	void remoteCloseDataChannels();
 
 	shared_ptr<Track> emplaceTrack(Description::Media description);
-	void incomingTrack(Description::Media description);
 	void iterateTracks(std::function<void(shared_ptr<Track> track)> func);
 	void openTracks();
 	void closeTracks();
@@ -88,6 +78,9 @@ struct PeerConnection : std::enable_shared_from_this<PeerConnection> {
 	void processRemoteDescription(Description description);
 	void processRemoteCandidate(Candidate candidate);
 	string localBundleMid() const;
+
+	void setMediaHandler(shared_ptr<MediaHandler> handler);
+	shared_ptr<MediaHandler> getMediaHandler();
 
 	void triggerDataChannel(weak_ptr<DataChannel> weakDataChannel);
 	void triggerTrack(weak_ptr<Track> weakTrack);
@@ -106,7 +99,11 @@ struct PeerConnection : std::enable_shared_from_this<PeerConnection> {
 
 	// Helper method for asynchronous callback invocation
 	template <typename... Args> void trigger(synchronized_callback<Args...> *cb, Args... args) {
-		(*cb)(std::move(args...));
+		try {
+			(*cb)(std::move(args...));
+		} catch (const std::exception &e) {
+			PLOG_WARNING << "Uncaught exception in callback: " << e.what();
+		}
 	}
 
 	const Configuration config;
@@ -114,6 +111,7 @@ struct PeerConnection : std::enable_shared_from_this<PeerConnection> {
 	std::atomic<GatheringState> gatheringState = GatheringState::New;
 	std::atomic<SignalingState> signalingState = SignalingState::Stable;
 	std::atomic<bool> negotiationNeeded = false;
+	std::atomic<bool> closing = false;
 	std::mutex signalingMutex;
 
 	synchronized_callback<shared_ptr<rtc::DataChannel>> dataChannelCallback;
@@ -134,6 +132,10 @@ private:
 	optional<Description> mLocalDescription, mRemoteDescription;
 	optional<Description> mCurrentLocalDescription;
 	mutable std::mutex mLocalDescriptionMutex, mRemoteDescriptionMutex;
+
+	shared_ptr<MediaHandler> mMediaHandler;
+
+	mutable std::shared_mutex mMediaHandlerMutex;
 
 	shared_ptr<IceTransport> mIceTransport;
 	shared_ptr<DtlsTransport> mDtlsTransport;

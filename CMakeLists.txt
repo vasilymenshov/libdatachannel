@@ -1,14 +1,18 @@
 cmake_minimum_required(VERSION 3.7)
 project(libdatachannel
-	VERSION 0.17.10
+	VERSION 0.18.2
 	LANGUAGES CXX)
 set(PROJECT_DESCRIPTION "C/C++ WebRTC network library featuring Data Channels, Media Transport, and WebSockets")
 
 # Options
 option(USE_GNUTLS "Use GnuTLS instead of OpenSSL" OFF)
 option(USE_NICE "Use libnice instead of libjuice" OFF)
-option(USE_SYSTEM_SRTP "Use system libSRTP" OFF)
-option(USE_SYSTEM_JUICE "Use system libjuice" OFF)
+option(PREFER_SYSTEM_LIB "Prefer system libraries over deps folder" OFF)
+option(USE_SYSTEM_SRTP "Use system libSRTP" ${PREFER_SYSTEM_LIB})
+option(USE_SYSTEM_JUICE "Use system libjuice" ${PREFER_SYSTEM_LIB})
+option(USE_SYSTEM_USRSCTP "Use system libusrsctp" ${PREFER_SYSTEM_LIB})
+option(USE_SYSTEM_PLOG "Use system Plog" ${PREFER_SYSTEM_LIB})
+option(USE_SYSTEM_JSON "Use system Nlohmann JSON" ${PREFER_SYSTEM_LIB})
 option(NO_WEBSOCKET "Disable WebSocket support" OFF)
 option(NO_MEDIA "Disable media transport support" OFF)
 option(NO_EXAMPLES "Disable examples" OFF)
@@ -121,9 +125,11 @@ set(LIBDATACHANNEL_IMPL_SOURCES
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/sha.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/pollinterrupter.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/pollservice.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/httpproxytransport.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/tcpserver.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/tcptransport.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/tlstransport.cpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/transport.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/verifiedtlstransport.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/websocket.cpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/websocketserver.cpp
@@ -152,9 +158,11 @@ set(LIBDATACHANNEL_IMPL_HEADERS
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/sha.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/pollinterrupter.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/pollservice.hpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/httpproxytransport.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/tcpserver.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/tcptransport.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/tlstransport.hpp
+	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/transport.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/verifiedtlstransport.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/websocket.hpp
 	${CMAKE_CURRENT_SOURCE_DIR}/src/impl/websocketserver.hpp
@@ -200,44 +208,57 @@ set(CMAKE_THREAD_PREFER_PTHREAD TRUE)
 set(THREADS_PREFER_PTHREAD_FLAG TRUE)
 find_package(Threads REQUIRED)
 
-set(CMAKE_POLICY_DEFAULT_CMP0048 NEW)
-add_subdirectory(deps/plog EXCLUDE_FROM_ALL)
+if(USE_SYSTEM_PLOG)
+	find_package(plog REQUIRED)
+else()
+	set(CMAKE_POLICY_DEFAULT_CMP0048 NEW)
+	add_subdirectory(deps/plog EXCLUDE_FROM_ALL)
+endif()
 
 if(SCTP_DEBUG)
 	add_definitions(-DSCTP_DEBUG)
 endif()
-option(sctp_build_shared_lib OFF)
-option(sctp_build_programs OFF)
-option(sctp_inet OFF)
-option(sctp_inet6 OFF)
-set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
-add_subdirectory(deps/usrsctp EXCLUDE_FROM_ALL)
-if (MSYS OR MINGW)
-	target_compile_definitions(usrsctp PUBLIC -DSCTP_STDINT_INCLUDE=<stdint.h>)
+
+if(USE_SYSTEM_USRSCTP)
+	find_package(Usrsctp REQUIRED)
+else()
+	option(sctp_build_shared_lib OFF)
+	option(sctp_build_programs OFF)
+	option(sctp_inet OFF)
+	option(sctp_inet6 OFF)
+	set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+	add_subdirectory(deps/usrsctp EXCLUDE_FROM_ALL)
+	if (MSYS OR MINGW)
+		target_compile_definitions(usrsctp PUBLIC -DSCTP_STDINT_INCLUDE=<stdint.h>)
+	endif()
+	if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
+    	target_compile_options(usrsctp PRIVATE -Wno-error=format-truncation)
+	endif()
+	add_library(Usrsctp::Usrsctp ALIAS usrsctp)
 endif()
-if (CMAKE_CXX_COMPILER_ID MATCHES "GNU")
-    target_compile_options(usrsctp PRIVATE -Wno-error=format-truncation)
-endif()
-add_library(Usrsctp::Usrsctp ALIAS usrsctp)
 
 add_library(datachannel SHARED
 	${LIBDATACHANNEL_SOURCES}
 	${LIBDATACHANNEL_HEADERS}
 	${LIBDATACHANNEL_IMPL_SOURCES}
 	${LIBDATACHANNEL_IMPL_HEADERS})
+set_target_properties(datachannel PROPERTIES
+	VERSION ${PROJECT_VERSION}
+	SOVERSION ${PROJECT_VERSION}
+	CXX_STANDARD 17
+	CXX_VISIBILITY_PRESET default)
+target_compile_definitions(datachannel PRIVATE RTC_EXPORTS)
+
 add_library(datachannel-static STATIC EXCLUDE_FROM_ALL
 	${LIBDATACHANNEL_SOURCES}
 	${LIBDATACHANNEL_HEADERS}
 	${LIBDATACHANNEL_IMPL_SOURCES}
 	${LIBDATACHANNEL_IMPL_HEADERS})
-
-set_target_properties(datachannel PROPERTIES
-	VERSION ${PROJECT_VERSION}
-	CXX_STANDARD 17
-	CXX_VISIBILITY_PRESET default)
 set_target_properties(datachannel-static PROPERTIES
 	VERSION ${PROJECT_VERSION}
 	CXX_STANDARD 17)
+target_compile_definitions(datachannel-static PRIVATE RTC_EXPORTS)
+target_compile_definitions(datachannel-static PUBLIC RTC_STATIC)
 
 target_include_directories(datachannel PUBLIC
     $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>
@@ -467,7 +488,11 @@ endif()
 # Examples
 if(NOT NO_EXAMPLES)
 	set(JSON_BuildTests OFF CACHE INTERNAL "")
-	add_subdirectory(deps/json EXCLUDE_FROM_ALL)
+	if(USE_SYSTEM_JSON)
+		find_package(nlohmann_json REQUIRED)
+	else()
+		add_subdirectory(deps/json EXCLUDE_FROM_ALL)
+	endif()
 
 	if(NOT NO_WEBSOCKET)
 		add_subdirectory(examples/client)

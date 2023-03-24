@@ -1,19 +1,9 @@
 /**
  * Copyright (c) 2020-2021 Paul-Louis Ageneau
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 #ifndef RTC_IMPL_WS_TRANSPORT_H
@@ -25,23 +15,28 @@
 
 #if RTC_ENABLE_WEBSOCKET
 
+#include <atomic>
+
 namespace rtc::impl {
 
+class HttpProxyTransport;
 class TcpTransport;
 class TlsTransport;
 
-class WsTransport final : public Transport {
+class WsTransport final : public Transport, public std::enable_shared_from_this<WsTransport> {
 public:
-	WsTransport(variant<shared_ptr<TcpTransport>, shared_ptr<TlsTransport>> lower,
-	            shared_ptr<WsHandshake> handshake, int maxOutstandingPings,
-	            message_callback recvCallback, state_callback stateCallback);
+	WsTransport(
+	    variant<shared_ptr<TcpTransport>, shared_ptr<HttpProxyTransport>, shared_ptr<TlsTransport>>
+	        lower,
+	    shared_ptr<WsHandshake> handshake, int maxOutstandingPings, message_callback recvCallback,
+	    state_callback stateCallback);
 	~WsTransport();
 
 	void start() override;
-	bool stop() override;
+	void stop() override;
 	bool send(message_ptr message) override;
-	void incoming(message_ptr message) override;
 	void close();
+	void incoming(message_ptr message) override;
 
 	bool isClient() const { return mIsClient; }
 
@@ -80,8 +75,9 @@ private:
 	binary mBuffer;
 	binary mPartial;
 	Opcode mPartialOpcode;
-	int mOutstandingPings = 0;
 	std::mutex mSendMutex;
+	int mOutstandingPings = 0;
+	std::atomic<bool> mCloseSent = false;
 };
 
 } // namespace rtc::impl

@@ -2,19 +2,9 @@
  * Copyright (c) 2019 Paul-Louis Ageneau
  * Copyright (c) 2020 Filip Klembara (in2core)
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 #include "peerconnection.hpp"
@@ -79,15 +69,25 @@ PeerConnection::~PeerConnection() {
 }
 
 void PeerConnection::close() {
-	PLOG_VERBOSE << "Closing PeerConnection";
-
 	negotiationNeeded = false;
+	if (!closing.exchange(true)) {
+		PLOG_VERBOSE << "Closing PeerConnection";
+		if (auto transport = std::atomic_load(&mSctpTransport))
+			transport->stop();
+		else
+			remoteClose();
+	}
+}
 
-	// Close data channels and tracks asynchronously
-	mProcessor.enqueue(&PeerConnection::closeDataChannels, shared_from_this());
-	mProcessor.enqueue(&PeerConnection::closeTracks, shared_from_this());
+void PeerConnection::remoteClose() {
+	close();
+	if (state.load() != State::Closed) {
+		// Close data channels and tracks asynchronously
+		mProcessor.enqueue(&PeerConnection::closeDataChannels, shared_from_this());
+		mProcessor.enqueue(&PeerConnection::closeTracks, shared_from_this());
 
-	closeTransports();
+		closeTransports();
+	}
 }
 
 optional<Description> PeerConnection::localDescription() const {
@@ -125,11 +125,10 @@ shared_ptr<T> emplaceTransport(PeerConnection *pc, shared_ptr<T> *member, shared
 		transport->start();
 	} catch (...) {
 		std::atomic_store(member, decltype(transport)(nullptr));
-		transport->stop();
 		throw;
 	}
 
-	if (pc->state.load() == PeerConnection::State::Closed) {
+	if (pc->closing.load() || pc->state.load() == PeerConnection::State::Closed) {
 		std::atomic_store(member, decltype(transport)(nullptr));
 		transport->stop();
 		return nullptr;
@@ -155,14 +154,16 @@ shared_ptr<IceTransport> PeerConnection::initIceTransport() {
 			    case IceTransport::State::Connecting:
 				    changeState(State::Connecting);
 				    break;
-			    case IceTransport::State::Failed:
-				    changeState(State::Failed);
-				    break;
 			    case IceTransport::State::Connected:
 				    initDtlsTransport();
 				    break;
+			    case IceTransport::State::Failed:
+				    changeState(State::Failed);
+				    mProcessor.enqueue(&PeerConnection::remoteClose, shared_from_this());
+				    break;
 			    case IceTransport::State::Disconnected:
 				    changeState(State::Disconnected);
+				    mProcessor.enqueue(&PeerConnection::remoteClose, shared_from_this());
 				    break;
 			    default:
 				    // Ignore
@@ -226,11 +227,11 @@ shared_ptr<DtlsTransport> PeerConnection::initDtlsTransport() {
 				    break;
 			    case DtlsTransport::State::Failed:
 				    changeState(State::Failed);
-				    mProcessor.enqueue(&PeerConnection::closeTracks, shared_from_this());
+				    mProcessor.enqueue(&PeerConnection::remoteClose, shared_from_this());
 				    break;
 			    case DtlsTransport::State::Disconnected:
 				    changeState(State::Disconnected);
-				    mProcessor.enqueue(&PeerConnection::closeTracks, shared_from_this());
+				    mProcessor.enqueue(&PeerConnection::remoteClose, shared_from_this());
 				    break;
 			    default:
 				    // Ignore
@@ -239,7 +240,8 @@ shared_ptr<DtlsTransport> PeerConnection::initDtlsTransport() {
 		    };
 
 		shared_ptr<DtlsTransport> transport;
-		if (auto local = localDescription(); local && local->hasAudioOrVideo()) {
+		auto local = localDescription();
+		if (config.forceMediaTransport || (local && local->hasAudioOrVideo())) {
 #if RTC_ENABLE_MEDIA
 			PLOG_INFO << "This connection requires media support";
 
@@ -298,6 +300,7 @@ shared_ptr<SctpTransport> PeerConnection::initSctpTransport() {
 			    auto shared_this = weak_this.lock();
 			    if (!shared_this)
 				    return;
+
 			    switch (transportState) {
 			    case SctpTransport::State::Connected:
 				    changeState(State::Connected);
@@ -305,15 +308,12 @@ shared_ptr<SctpTransport> PeerConnection::initSctpTransport() {
 				    mProcessor.enqueue(&PeerConnection::openDataChannels, shared_from_this());
 				    break;
 			    case SctpTransport::State::Failed:
-				    LOG_WARNING << "SCTP transport failed";
 				    changeState(State::Failed);
-				    mProcessor.enqueue(&PeerConnection::remoteCloseDataChannels,
-				                       shared_from_this());
+				    mProcessor.enqueue(&PeerConnection::remoteClose, shared_from_this());
 				    break;
 			    case SctpTransport::State::Disconnected:
 				    changeState(State::Disconnected);
-				    mProcessor.enqueue(&PeerConnection::remoteCloseDataChannels,
-				                       shared_from_this());
+				    mProcessor.enqueue(&PeerConnection::remoteClose, shared_from_this());
 				    break;
 			    default:
 				    // Ignore
@@ -349,7 +349,8 @@ void PeerConnection::closeTransports() {
 	if (!changeState(State::Closed))
 		return; // already closed
 
-	// Reset callbacks now that state is changed
+	// Reset intercceptor and callbacks now that state is changed
+	setMediaHandler(nullptr);
 	resetCallbacks();
 
 	// Pass the pointers to a thread, allowing to terminate a transport from its own thread
@@ -369,18 +370,18 @@ void PeerConnection::closeTransports() {
 		if (t)
 			t->onStateChange(nullptr);
 
-	// Initiate transport stop on the processor after closing the data channels
-	mProcessor.enqueue([self = shared_from_this(), transports = std::move(transports)]() {
-		TearDownProcessor::Instance().enqueue(
-		    [transports = std::move(transports), token = Init::Instance().token()]() mutable {
-			    for (const auto &t : transports)
-				    if (t)
-					    t->stop();
+	TearDownProcessor::Instance().enqueue(
+	    [transports = std::move(transports), token = Init::Instance().token()]() mutable {
+		    for (const auto &t : transports) {
+			    if (t) {
+				    t->stop();
+				    break;
+			    }
+		    }
 
-			    for (auto &t : transports)
-				    t.reset();
-		    });
-	});
+		    for (auto &t : transports)
+			    t.reset();
+	    });
 }
 
 void PeerConnection::endLocalCandidates() {
@@ -423,15 +424,15 @@ void PeerConnection::forwardMessage(message_ptr message) {
 		return;
 	}
 
+	auto iceTransport = std::atomic_load(&mIceTransport);
+	auto sctpTransport = std::atomic_load(&mSctpTransport);
+	if (!iceTransport || !sctpTransport)
+		return;
+
 	const uint16_t stream = uint16_t(message->stream);
 	auto channel = findDataChannel(stream);
 
 	if (DataChannel::IsOpenMessage(message)) {
-		auto iceTransport = getIceTransport();
-		auto sctpTransport = getSctpTransport();
-		if (!iceTransport || !sctpTransport)
-			return;
-
 		const uint16_t remoteParity = (iceTransport->role() == Description::Role::Active) ? 1 : 0;
 		if (stream % 2 != remoteParity) {
 			// The odd/even rule is violated, close the DataChannel
@@ -461,9 +462,7 @@ void PeerConnection::forwardMessage(message_ptr message) {
 
 		// Invalid, close the DataChannel
 		PLOG_WARNING << "Got unexpected message on stream " << stream;
-		if (auto sctpTransport = getSctpTransport())
-			sctpTransport->closeStream(message->stream);
-
+		sctpTransport->closeStream(message->stream);
 		return;
 	}
 
@@ -474,6 +473,14 @@ void PeerConnection::forwardMessage(message_ptr message) {
 void PeerConnection::forwardMedia(message_ptr message) {
 	if (!message)
 		return;
+
+	auto handler = getMediaHandler();
+
+	if (handler) {
+		message = handler->incoming(message);
+		if (!message)
+			return;
+	}
 
 	// Browsers like to compound their packets with a random SSRC.
 	// we have to do this monstrosity to distribute the report blocks
@@ -582,7 +589,7 @@ shared_ptr<DataChannel> PeerConnection::emplaceDataChannel(string label, DataCha
 	lock.unlock(); // we are going to call assignDataChannels()
 
 	// If SCTP is connected, assign and open now
-	auto sctpTransport = getSctpTransport();
+	auto sctpTransport = std::atomic_load(&mSctpTransport);
 	if (sctpTransport && sctpTransport->state() == SctpTransport::State::Connected) {
 		assignDataChannels();
 		channel->open(sctpTransport);
@@ -608,7 +615,7 @@ uint16_t PeerConnection::maxDataChannelStream() const {
 void PeerConnection::assignDataChannels() {
 	std::unique_lock lock(mDataChannelsMutex); // we are going to emplace
 
-	auto iceTransport = getIceTransport();
+	auto iceTransport = std::atomic_load(&mIceTransport);
 	if (!iceTransport)
 		throw std::logic_error("Attempted to assign DataChannels without ICE transport");
 
@@ -716,27 +723,10 @@ shared_ptr<Track> PeerConnection::emplaceTrack(Description::Media description) {
 		mTrackLines.emplace_back(track);
 	}
 
-	if (description.isRemoved())
+	if (track->description().isRemoved())
 		track->close();
 
 	return track;
-}
-
-void PeerConnection::incomingTrack(Description::Media description) {
-	std::unique_lock lock(mTracksMutex); // we are going to emplace
-	shared_ptr<Track> track;
-	if (auto it = mTracks.find(description.mid()); it != mTracks.end()) {
-		if (track = it->second.lock(); track)
-			track->setDescription(std::move(description));
-	} else {
-		track = std::make_shared<Track>(weak_from_this(), std::move(description));
-		mTracks.emplace(std::make_pair(track->mid(), track));
-		mTrackLines.emplace_back(track);
-		triggerTrack(track);
-	}
-
-	if (track && description.isRemoved())
-		track->close();
 }
 
 void PeerConnection::iterateTracks(std::function<void(shared_ptr<Track> track)> func) {
@@ -757,9 +747,21 @@ void PeerConnection::openTracks() {
 #if RTC_ENABLE_MEDIA
 	if (auto transport = std::atomic_load(&mDtlsTransport)) {
 		auto srtpTransport = std::dynamic_pointer_cast<DtlsSrtpTransport>(transport);
-		iterateTracks([&](shared_ptr<Track> track) {
-			if (!track->isOpen())
-				track->open(srtpTransport);
+
+		iterateTracks([&](const shared_ptr<Track> &track) {
+			if (!track->isOpen()) {
+				if (srtpTransport) {
+					track->open(srtpTransport);
+				} else {
+					// A track was added during a latter renegotiation, whereas SRTP transport was
+					// not initialized. This is an optimization to use the library with data
+					// channels only. Set forceMediaTransport to true to initialize the transport
+					// before dynamically adding tracks.
+					auto errorMsg = "The connection has no media transport";
+					PLOG_ERROR << errorMsg;
+					track->triggerError(errorMsg);
+				}
+			}
 		});
 	}
 #endif
@@ -869,7 +871,6 @@ void PeerConnection::processLocalDescription(Description description) {
 					        }
 					        return;
 				        }
-				        lock.unlock(); // we are going to call incomingTrack()
 
 				        auto reciprocated = remoteMedia->reciprocate();
 #if !RTC_ENABLE_MEDIA
@@ -879,13 +880,22 @@ void PeerConnection::processLocalDescription(Description description) {
 					        reciprocated.markRemoved();
 				        }
 #endif
-				        incomingTrack(reciprocated);
 
 				        PLOG_DEBUG << "Reciprocating media in local description, mid=\""
 				                   << reciprocated.mid() << "\", removed=" << std::boolalpha
 				                   << reciprocated.isRemoved();
 
-				        description.addMedia(std::move(reciprocated));
+				        // Create incoming track
+				        auto track =
+				            std::make_shared<Track>(weak_from_this(), std::move(reciprocated));
+				        mTracks.emplace(std::make_pair(track->mid(), track));
+				        mTrackLines.emplace_back(track);
+				        triggerTrack(track); // The user may modify the track description
+
+				        if (track->description().isRemoved())
+					        track->close();
+
+				        description.addMedia(track->description());
 			        },
 			    },
 			    remote->media(i));
@@ -1007,12 +1017,6 @@ void PeerConnection::processRemoteDescription(Description description) {
 		mRemoteDescription->addCandidates(std::move(existingCandidates));
 	}
 
-	auto iceTransport = initIceTransport();
-	if (!iceTransport)
-		return; // closed
-
-	iceTransport->setRemoteDescription(std::move(description));
-
 	if (description.hasApplication()) {
 		auto dtlsTransport = std::atomic_load(&mDtlsTransport);
 		auto sctpTransport = std::atomic_load(&mSctpTransport);
@@ -1066,6 +1070,18 @@ string PeerConnection::localBundleMid() const {
 	return mLocalDescription ? mLocalDescription->bundleMid() : "0";
 }
 
+void PeerConnection::setMediaHandler(shared_ptr<MediaHandler> handler) {
+	std::unique_lock lock(mMediaHandlerMutex);
+	if (mMediaHandler)
+		mMediaHandler->onOutgoing(nullptr);
+	mMediaHandler = handler;
+}
+
+shared_ptr<MediaHandler> PeerConnection::getMediaHandler() {
+	std::shared_lock lock(mMediaHandlerMutex);
+	return mMediaHandler;
+}
+
 void PeerConnection::triggerDataChannel(weak_ptr<DataChannel> weakDataChannel) {
 	auto dataChannel = weakDataChannel.lock();
 	if (dataChannel) {
@@ -1086,24 +1102,36 @@ void PeerConnection::triggerTrack(weak_ptr<Track> weakTrack) {
 
 void PeerConnection::triggerPendingDataChannels() {
 	while (dataChannelCallback) {
-		auto next = mPendingDataChannels.tryPop();
+		auto next = mPendingDataChannels.pop();
 		if (!next)
 			break;
 
 		auto impl = std::move(*next);
-		dataChannelCallback(std::make_shared<rtc::DataChannel>(impl));
+
+		try {
+			dataChannelCallback(std::make_shared<rtc::DataChannel>(impl));
+		} catch (const std::exception &e) {
+			PLOG_WARNING << "Uncaught exception in callback: " << e.what();
+		}
+
 		impl->triggerOpen();
 	}
 }
 
 void PeerConnection::triggerPendingTracks() {
 	while (trackCallback) {
-		auto next = mPendingTracks.tryPop();
+		auto next = mPendingTracks.pop();
 		if (!next)
 			break;
 
 		auto impl = std::move(*next);
-		trackCallback(std::make_shared<rtc::Track>(impl));
+
+		try {
+			trackCallback(std::make_shared<rtc::Track>(impl));
+		} catch (const std::exception &e) {
+			PLOG_WARNING << "Uncaught exception in callback: " << e.what();
+		}
+
 		// Do not trigger open immediately for tracks as it'll be done later
 	}
 }

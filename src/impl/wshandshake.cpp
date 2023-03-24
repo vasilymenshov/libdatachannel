@@ -1,19 +1,9 @@
 /**
  * Copyright (c) 2020-2021 Paul-Louis Ageneau
  *
- * This library is free software; you can redistribute it and/or
- * modify it under the terms of the GNU Lesser General Public
- * License as published by the Free Software Foundation; either
- * version 2.1 of the License, or (at your option) any later version.
- *
- * This library is distributed in the hope that it will be useful,
- * but WITHOUT ANY WARRANTY; without even the implied warranty of
- * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
- * Lesser General Public License for more details.
- *
- * You should have received a copy of the GNU Lesser General Public
- * License along with this library; if not, write to the Free Software
- * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+ * This Source Code Form is subject to the terms of the Mozilla Public
+ * License, v. 2.0. If a copy of the MPL was not distributed with this
+ * file, You can obtain one at https://mozilla.org/MPL/2.0/.
  */
 
 #include "wshandshake.hpp"
@@ -36,8 +26,6 @@ namespace rtc::impl {
 
 using std::to_string;
 using std::chrono::system_clock;
-using random_bytes_engine =
-    std::independent_bits_engine<std::default_random_engine, CHAR_BIT, unsigned short>;
 
 WsHandshake::WsHandshake() {}
 
@@ -145,7 +133,7 @@ string WsHandshake::generateHttpError(int responseCode) {
 size_t WsHandshake::parseHttpRequest(const byte *buffer, size_t size) {
 	std::unique_lock lock(mMutex);
 	std::list<string> lines;
-	size_t length = parseHttpLines(buffer, size, lines);
+	size_t length = utils::parseHttpLines(buffer, size, lines);
 	if (length == 0)
 		return 0;
 
@@ -163,7 +151,7 @@ size_t WsHandshake::parseHttpRequest(const byte *buffer, size_t size) {
 
 	mPath = std::move(path);
 
-	auto headers = parseHttpHeaders(lines);
+	auto headers = utils::parseHttpHeaders(lines);
 
 	auto h = headers.find("host");
 	if (h == headers.end())
@@ -197,7 +185,7 @@ size_t WsHandshake::parseHttpRequest(const byte *buffer, size_t size) {
 size_t WsHandshake::parseHttpResponse(const byte *buffer, size_t size) {
 	std::unique_lock lock(mMutex);
 	std::list<string> lines;
-	size_t length = parseHttpLines(buffer, size, lines);
+	size_t length = utils::parseHttpLines(buffer, size, lines);
 	if (length == 0)
 		return 0;
 
@@ -214,7 +202,7 @@ size_t WsHandshake::parseHttpResponse(const byte *buffer, size_t size) {
 	if (code != 101)
 		throw std::runtime_error("Unexpected response code " + to_string(code) + " for WebSocket");
 
-	auto headers = parseHttpHeaders(lines);
+	auto headers = utils::parseHttpHeaders(lines);
 
 	auto h = headers.find("upgrade");
 	if (h == headers.end())
@@ -240,52 +228,14 @@ string WsHandshake::generateKey() {
 	// RFC 6455: The request MUST include a header field with the name Sec-WebSocket-Key.  The value
 	// of this header field MUST be a nonce consisting of a randomly selected 16-byte value that has
 	// been base64-encoded. [...] The nonce MUST be selected randomly for each connection.
-	auto seed = static_cast<unsigned int>(system_clock::now().time_since_epoch().count());
-	random_bytes_engine generator(seed);
 	binary key(16);
 	auto k = reinterpret_cast<uint8_t *>(key.data());
-	std::generate(k, k + key.size(), [&]() { return uint8_t(generator()); });
+	std::generate(k, k + key.size(), utils::random_bytes_engine());
 	return utils::base64_encode(key);
 }
 
 string WsHandshake::computeAcceptKey(const string &key) {
 	return utils::base64_encode(Sha1(string(key) + "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"));
-}
-
-size_t WsHandshake::parseHttpLines(const byte *buffer, size_t size, std::list<string> &lines) {
-	lines.clear();
-	auto begin = reinterpret_cast<const char *>(buffer);
-	auto end = begin + size;
-	auto cur = begin;
-	while (true) {
-		auto last = cur;
-		cur = std::find(cur, end, '\n');
-		if (cur == end)
-			return 0;
-		string line(last, cur != begin && *std::prev(cur) == '\r' ? std::prev(cur++) : cur++);
-		if (line.empty())
-			break;
-		lines.emplace_back(std::move(line));
-	}
-
-	return cur - begin;
-}
-
-std::multimap<string, string> WsHandshake::parseHttpHeaders(const std::list<string> &lines) {
-	std::multimap<string, string> headers;
-	for (const auto &line : lines) {
-		if (size_t pos = line.find_first_of(':'); pos != string::npos) {
-			string key = line.substr(0, pos);
-			string value = line.substr(line.find_first_not_of(' ', pos + 1));
-			std::transform(key.begin(), key.end(), key.begin(),
-			               [](char c) { return std::tolower(c); });
-			headers.emplace(std::move(key), std::move(value));
-		} else {
-			headers.emplace(line, "");
-		}
-	}
-
-	return headers;
 }
 
 WsHandshake::Error::Error(const string &w) : std::runtime_error(w) {}
