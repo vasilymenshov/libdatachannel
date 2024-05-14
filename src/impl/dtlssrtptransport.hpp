@@ -24,20 +24,16 @@
 
 namespace rtc::impl {
 
-struct EncryptionParams {
-	unsigned int keySize;
-	unsigned int saltSize;
-	srtp_profile_t srtpProfile;
-};
-
 class DtlsSrtpTransport final : public DtlsTransport {
 public:
 	static void Init();
 	static void Cleanup();
+	static bool IsGcmSupported();
 
 	DtlsSrtpTransport(shared_ptr<IceTransport> lower, certificate_ptr certificate,
-	                  optional<size_t> mtu, verifier_callback verifierCallback,
-	                  message_callback srtpRecvCallback, state_callback stateChangeCallback);
+	                  optional<size_t> mtu, CertificateFingerprint::Algorithm fingerprintAlgorithm,
+	                  verifier_callback verifierCallback, message_callback srtpRecvCallback,
+	                  state_callback stateChangeCallback);
 	~DtlsSrtpTransport();
 
 	bool sendMedia(message_ptr message);
@@ -46,11 +42,19 @@ private:
 	void recvMedia(message_ptr message);
 	bool demuxMessage(message_ptr message) override;
 	void postHandshake() override;
-	EncryptionParams getEncryptionParams(string_view suite);
+
+#if !USE_GNUTLS && !USE_MBEDTLS
+	struct ProfileParams {
+		srtp_profile_t srtpProfile;
+		size_t keySize;
+		size_t saltSize;
+	};
+
+	ProfileParams getProfileParamsFromName(string_view name);
+#endif
+
 	message_callback mSrtpRecvCallback;
-
 	srtp_t mSrtpIn, mSrtpOut;
-
 	std::atomic<bool> mInitDone = false;
 	std::vector<unsigned char> mClientSessionKey;
 	std::vector<unsigned char> mServerSessionKey;

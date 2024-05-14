@@ -13,7 +13,7 @@
 
 #include "channel.hpp"
 #include "common.hpp"
-#include "configuration.hpp" // for ProxyServer
+#include "configuration.hpp"
 
 namespace rtc {
 
@@ -32,13 +32,7 @@ public:
 		Closed = 3,
 	};
 
-	struct Configuration {
-		bool disableTlsVerification = false; // if true, don't verify the TLS certificate
-		optional<ProxyServer> proxyServer;
-		std::vector<string> protocols;
-		optional<std::chrono::milliseconds> pingInterval; // zero to disable
-		optional<int> maxOutstandingPings;
-	};
+	using Configuration = WebSocketConfiguration;
 
 	WebSocket();
 	WebSocket(Configuration config);
@@ -63,6 +57,8 @@ public:
 private:
 	using CheshireCat<impl::WebSocket>::impl;
 };
+
+std::ostream &operator<<(std::ostream &out, WebSocket::State state);
 
 } // namespace rtc
 

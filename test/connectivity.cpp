@@ -21,7 +21,7 @@ using namespace std;
 
 template <class T> weak_ptr<T> make_weak_ptr(shared_ptr<T> ptr) { return ptr; }
 
-void test_connectivity() {
+void test_connectivity(bool signal_wrong_fingerprint) {
 	InitLogger(LogLevel::Debug);
 
 	Configuration config1;
@@ -47,8 +47,16 @@ void test_connectivity() {
 
 	PeerConnection pc2(config2);
 
-	pc1.onLocalDescription([&pc2](Description sdp) {
+	pc1.onLocalDescription([&pc2, signal_wrong_fingerprint](Description sdp) {
 		cout << "Description 1: " << sdp << endl;
+		if (signal_wrong_fingerprint) {
+			auto f = sdp.fingerprint();
+			if (f.has_value()) {
+				auto& c = f.value().value[0];
+				if (c == 'F' || c == 'f') c = '0'; else c++;
+				sdp.setFingerprint(f.value());
+			}
+		}
 		pc2.setRemoteDescription(string(sdp));
 	});
 
@@ -58,6 +66,10 @@ void test_connectivity() {
 	});
 
 	pc1.onStateChange([](PeerConnection::State state) { cout << "State 1: " << state << endl; });
+
+	pc1.onIceStateChange([](PeerConnection::IceState state) {
+		cout << "ICE state 1: " << state << endl;
+	});
 
 	pc1.onGatheringStateChange([](PeerConnection::GatheringState state) {
 		cout << "Gathering state 1: " << state << endl;
@@ -78,6 +90,10 @@ void test_connectivity() {
 	});
 
 	pc2.onStateChange([](PeerConnection::State state) { cout << "State 2: " << state << endl; });
+
+	pc2.onIceStateChange([](PeerConnection::IceState state) {
+		cout << "ICE state 2: " << state << endl;
+	});
 
 	pc2.onGatheringStateChange([](PeerConnection::GatheringState state) {
 		cout << "Gathering state 2: " << state << endl;
@@ -135,9 +151,15 @@ void test_connectivity() {
 	while ((!(adc2 = std::atomic_load(&dc2)) || !adc2->isOpen() || !dc1->isOpen()) && attempts--)
 		this_thread::sleep_for(1s);
 
-	if (pc1.state() != PeerConnection::State::Connected &&
+	if (pc1.state() != PeerConnection::State::Connected ||
 	    pc2.state() != PeerConnection::State::Connected)
 		throw runtime_error("PeerConnection is not connected");
+
+	if ((pc1.iceState() != PeerConnection::IceState::Connected &&
+	     pc1.iceState() != PeerConnection::IceState::Completed) ||
+	    (pc2.iceState() != PeerConnection::IceState::Connected &&
+	     pc2.iceState() != PeerConnection::IceState::Completed))
+		throw runtime_error("ICE is not connected");
 
 	if (!adc2 || !adc2->isOpen() || !dc1->isOpen())
 		throw runtime_error("DataChannel is not open");
@@ -238,6 +260,58 @@ void test_connectivity() {
 	this_thread::sleep_for(1s);
 	pc2.close();
 	this_thread::sleep_for(1s);
+
+	cout << "Success" << endl;
+}
+
+const char* key_pem =
+"-----BEGIN PRIVATE KEY-----\n"
+"MIGHAgEAMBMGByqGSM49AgEGCCqGSM49AwEHBG0wawIBAQQg3bbuT2SjSlMZH/J1\n"
+"vHwmF0Blb/DBc/v7f1Za9GPUXHmhRANCAATDpmYxZozjVw6xlERNjJJGgfY3bEmj\n"
+"xAKFRq3nbxbDHvMEs34u9HntMZWJ0hp3GUC+Ax7JHTv3cYqSaAg2SpR4\n"
+"-----END PRIVATE KEY-----\n";
+
+const char* cert_pem =
+"-----BEGIN CERTIFICATE-----\n"
+"MIIBgjCCASigAwIBAgIJAPMXEoZXOaDEMAoGCCqGSM49BAMCMEoxDzANBgNVBAMM\n"
+"BmNhLmNvbTELMAkGA1UEBhMCVVMxCzAJBgNVBAcMAkNBMRAwDgYDVQQKDAdleGFt\n"
+"cGxlMQswCQYDVQQIDAJDQTAeFw0yNDA1MDUxNjAzMjFaFw0yNDA4MTMxNjAzMjFa\n"
+"MDExCzAJBgNVBAYTAkNOMRAwDgYDVQQKDAdiYW96LmNuMRAwDgYDVQQDDAdiYW96\n"
+"Lm1lMFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEw6ZmMWaM41cOsZRETYySRoH2\n"
+"N2xJo8QChUat528Wwx7zBLN+LvR57TGVidIadxlAvgMeyR0793GKkmgINkqUeKMQ\n"
+"MA4wDAYDVR0TAQH/BAIwADAKBggqhkjOPQQDAgNIADBFAiAPNldqGJHryfjPFyX3\n"
+"zfHHWlO7xSDTzdyoxzroFdwy+gIhAKmZizEVvDlBiIe+3ptCArU3dbp+bzLynTcr\n"
+"Ma9ayzQy\n"
+"-----END CERTIFICATE-----\n";
+
+void test_pem() {
+	InitLogger(LogLevel::Debug);
+
+	Configuration config1;
+
+	config1.certificatePemFile = cert_pem;
+	config1.keyPemFile = key_pem;
+
+	PeerConnection pc1(config1);
+	atomic_bool done;
+	string f;
+
+	pc1.onLocalDescription([&done, &f](Description sdp) {
+		f = sdp.fingerprint().value().value;
+		done = true;
+	});
+
+	auto dc1 = pc1.createDataChannel("test");
+
+	// Wait a bit
+	int attempts = 10;
+	while (!done && attempts--)
+		this_thread::sleep_for(1s);
+
+	cout << "Fingerprint: " << f << endl;
+
+	if (f != "07:E5:6F:2A:1A:0C:2C:32:0E:C1:C3:9C:34:5A:78:4E:A5:8B:32:05:D1:57:D6:F4:E7:02:41:12:E6:01:C6:8F")
+		throw runtime_error("The fingerprint of the specified certificate do not match");
 
 	cout << "Success" << endl;
 }

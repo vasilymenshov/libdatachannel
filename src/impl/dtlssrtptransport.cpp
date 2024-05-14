@@ -45,12 +45,24 @@ void DtlsSrtpTransport::Init() { srtp_init(); }
 
 void DtlsSrtpTransport::Cleanup() { srtp_shutdown(); }
 
+bool DtlsSrtpTransport::IsGcmSupported() {
+#if RTC_SYSTEM_SRTP
+	// system libSRTP may not have GCM support
+	srtp_policy_t policy = {};
+	return srtp_crypto_policy_set_from_profile_for_rtp(
+	           &policy.rtp, srtp_profile_aead_aes_256_gcm) == srtp_err_status_ok;
+#else
+	return true;
+#endif
+}
+
 DtlsSrtpTransport::DtlsSrtpTransport(shared_ptr<IceTransport> lower,
                                      shared_ptr<Certificate> certificate, optional<size_t> mtu,
+                                     CertificateFingerprint::Algorithm fingerprintAlgorithm,
                                      verifier_callback verifierCallback,
                                      message_callback srtpRecvCallback,
                                      state_callback stateChangeCallback)
-    : DtlsTransport(lower, certificate, mtu, std::move(verifierCallback),
+    : DtlsTransport(lower, certificate, mtu, fingerprintAlgorithm, std::move(verifierCallback),
                     std::move(stateChangeCallback)),
       mSrtpRecvCallback(std::move(srtpRecvCallback)) { // distinct from Transport recv callback
 
@@ -92,7 +104,8 @@ bool DtlsSrtpTransport::sendMedia(message_ptr message) {
 
 	// srtp_protect() and srtp_protect_rtcp() assume that they can write SRTP_MAX_TRAILER_LEN (for
 	// the authentication tag) into the location in memory immediately following the RTP packet.
-	message->resize(size + SRTP_MAX_TRAILER_LEN);
+	// Copy instead of resizing so we don't interfere with media handlers keeping references
+	message = make_message(size + SRTP_MAX_TRAILER_LEN, message);
 
 	if (IsRtcp(*message)) { // Demultiplex RTCP and RTP using payload type
 		if (srtp_err_status_t err = srtp_protect_rtcp(mSrtpOut, message->data(), &size)) {
@@ -213,33 +226,23 @@ bool DtlsSrtpTransport::demuxMessage(message_ptr message) {
 	} else {
 		COUNTER_UNKNOWN_PACKET_TYPE++;
 		PLOG_DEBUG << "Unknown packet type, value=" << unsigned(value1)
-		             << ", size=" << message->size();
+		           << ", size=" << message->size();
 		return true;
 	}
-}
-
-EncryptionParams DtlsSrtpTransport::getEncryptionParams(string_view suite) {
-	if (suite == "SRTP_AES128_CM_SHA1_80")
-		return {SRTP_AES_128_KEY_LEN, SRTP_SALT_LEN, srtp_profile_aes128_cm_sha1_80};
-	if (suite == "SRTP_AES128_CM_SHA1_32")
-		return {SRTP_AES_128_KEY_LEN, SRTP_SALT_LEN, srtp_profile_aes128_cm_sha1_32};
-	if (suite == "SRTP_AEAD_AES_128_GCM")
-		return {SRTP_AES_128_KEY_LEN, SRTP_AEAD_SALT_LEN, srtp_profile_aead_aes_128_gcm};
-	if (suite == "SRTP_AEAD_AES_256_GCM")
-		return {SRTP_AES_256_KEY_LEN, SRTP_AEAD_SALT_LEN, srtp_profile_aead_aes_256_gcm};
-	throw std::logic_error("Unexpected SRTP suite name: " + std::string(suite));
 }
 
 void DtlsSrtpTransport::postHandshake() {
 	if (mInitDone)
 		return;
-	const unsigned char *clientKey, *clientSalt, *serverKey, *serverSalt;
+
 #if USE_GNUTLS
 	PLOG_INFO << "Deriving SRTP keying material (GnuTLS)";
-	unsigned int keySize = SRTP_AES_128_KEY_LEN;
-	unsigned int saltSize = SRTP_SALT_LEN;
-	auto srtpProfile = srtp_profile_aes128_cm_sha1_80;
-	auto keySizeWithSalt = SRTP_AES_ICM_128_KEY_LEN_WSALT;
+
+	const srtp_profile_t srtpProfile = srtp_profile_aes128_cm_sha1_80;
+	const size_t keySize = SRTP_AES_128_KEY_LEN;
+	const size_t saltSize = SRTP_SALT_LEN;
+	const size_t keySizeWithSalt = SRTP_AES_ICM_128_KEY_LEN_WSALT;
+
 	const size_t materialLen = keySizeWithSalt * 2;
 	std::vector<unsigned char> material(materialLen);
 	gnutls_datum_t clientKeyDatum, clientSaltDatum, serverKeyDatum, serverSaltDatum;
@@ -258,25 +261,61 @@ void DtlsSrtpTransport::postHandshake() {
 	if (serverSaltDatum.size != saltSize)
 		throw std::logic_error("Unexpected SRTP salt size: " + to_string(serverSaltDatum.size));
 
-	clientKey = reinterpret_cast<const unsigned char *>(clientKeyDatum.data);
-	clientSalt = reinterpret_cast<const unsigned char *>(clientSaltDatum.data);
+	const unsigned char *clientKey = reinterpret_cast<const unsigned char *>(clientKeyDatum.data);
+	const unsigned char *clientSalt = reinterpret_cast<const unsigned char *>(clientSaltDatum.data);
+	const unsigned char *serverKey = reinterpret_cast<const unsigned char *>(serverKeyDatum.data);
+	const unsigned char *serverSalt = reinterpret_cast<const unsigned char *>(serverSaltDatum.data);
 
-	serverKey = reinterpret_cast<const unsigned char *>(serverKeyDatum.data);
-	serverSalt = reinterpret_cast<const unsigned char *>(serverSaltDatum.data);
-#else
+#elif USE_MBEDTLS
+	PLOG_INFO << "Deriving SRTP keying material (Mbed TLS)";
+
+	mbedtls_dtls_srtp_info srtpInfo;
+	mbedtls_ssl_get_dtls_srtp_negotiation_result(&mSsl, &srtpInfo);
+	if (srtpInfo.MBEDTLS_PRIVATE(chosen_dtls_srtp_profile) != MBEDTLS_TLS_SRTP_AES128_CM_HMAC_SHA1_80)
+		throw std::runtime_error("Failed to get SRTP profile");
+
+	const srtp_profile_t srtpProfile = srtp_profile_aes128_cm_sha1_80;
+	const size_t keySize = SRTP_AES_128_KEY_LEN;
+	const size_t saltSize = SRTP_SALT_LEN;
+	const size_t keySizeWithSalt = SRTP_AES_ICM_128_KEY_LEN_WSALT;
+
+	if (mTlsProfile == MBEDTLS_SSL_TLS_PRF_NONE)
+		throw std::logic_error("TLS PRF type is not set");
+
+	// The extractor provides the client write master key, the server write master key, the client
+	// write master salt and the server write master salt in that order.
+	const string label = "EXTRACTOR-dtls_srtp";
+	const size_t materialLen = keySizeWithSalt * 2;
+	std::vector<unsigned char> material(materialLen);
+
+	if (mbedtls_ssl_tls_prf(mTlsProfile, reinterpret_cast<const unsigned char *>(mMasterSecret), 48,
+	                        label.c_str(), reinterpret_cast<const unsigned char *>(mRandBytes), 64,
+	                        material.data(), materialLen) != 0)
+		throw std::runtime_error("Failed to derive SRTP keys");
+
+	// Order is client key, server key, client salt, and server salt
+	const unsigned char *clientKey = material.data();
+	const unsigned char *serverKey = clientKey + keySize;
+	const unsigned char *clientSalt = serverKey + keySize;
+	const unsigned char *serverSalt = clientSalt + saltSize;
+
+#else // OpenSSL
 	PLOG_INFO << "Deriving SRTP keying material (OpenSSL)";
 	auto profile = SSL_get_selected_srtp_profile(mSsl);
 	if (!profile)
 		throw std::runtime_error("Failed to get SRTP profile: " +
-					openssl::error_string(ERR_get_error()));
-	PLOG_DEBUG << "srtp profile used is: " << profile->name;
-	auto [keySize, saltSize, srtpProfile] = getEncryptionParams(profile->name);
-	auto keySizeWithSalt = keySize + saltSize;
-	const size_t materialLen = keySizeWithSalt * 2;
-	std::vector<unsigned char> material(materialLen);
+		                         openssl::error_string(ERR_get_error()));
+
+	PLOG_DEBUG << "SRTP profile is: " << profile->name;
+
+	const auto [srtpProfile, keySize, saltSize] = getProfileParamsFromName(profile->name);
+	const size_t keySizeWithSalt = keySize + saltSize;
+
 	// The extractor provides the client write master key, the server write master key, the client
 	// write master salt and the server write master salt in that order.
 	const string label = "EXTRACTOR-dtls_srtp";
+	const size_t materialLen = keySizeWithSalt * 2;
+	std::vector<unsigned char> material(materialLen);
 
 	// returns 1 on success, 0 or -1 on failure (OpenSSL API is a complete mess...)
 	if (SSL_export_keying_material(mSsl, material.data(), materialLen, label.c_str(), label.size(),
@@ -285,11 +324,12 @@ void DtlsSrtpTransport::postHandshake() {
 		                         openssl::error_string(ERR_get_error()));
 
 	// Order is client key, server key, client salt, and server salt
-	clientKey = material.data();
-	serverKey = clientKey + keySize;
-	clientSalt = serverKey + keySize;
-	serverSalt = clientSalt + saltSize;
+	const unsigned char *clientKey = material.data();
+	const unsigned char *serverKey = clientKey + keySize;
+	const unsigned char *clientSalt = serverKey + keySize;
+	const unsigned char *serverSalt = clientSalt + saltSize;
 #endif
+
 	mClientSessionKey.resize(keySizeWithSalt);
 	mServerSessionKey.resize(keySizeWithSalt);
 	std::memcpy(mClientSessionKey.data(), clientKey, keySize);
@@ -299,11 +339,13 @@ void DtlsSrtpTransport::postHandshake() {
 	std::memcpy(mServerSessionKey.data() + keySize, serverSalt, saltSize);
 
 	srtp_policy_t inbound = {};
-	srtp_crypto_policy_set_from_profile_for_rtp(&inbound.rtp, srtpProfile);
-	srtp_crypto_policy_set_from_profile_for_rtcp(&inbound.rtcp, srtpProfile);
+	if (srtp_crypto_policy_set_from_profile_for_rtp(&inbound.rtp, srtpProfile))
+		throw std::runtime_error("SRTP profile is not supported");
+	if (srtp_crypto_policy_set_from_profile_for_rtcp(&inbound.rtcp, srtpProfile))
+		throw std::runtime_error("SRTP profile is not supported");
+
 	inbound.ssrc.type = ssrc_any_inbound;
 	inbound.key = mIsClient ? mServerSessionKey.data() : mClientSessionKey.data();
-
 	inbound.window_size = 1024;
 	inbound.allow_repeat_tx = true;
 	inbound.next = nullptr;
@@ -313,8 +355,11 @@ void DtlsSrtpTransport::postHandshake() {
 		                         to_string(static_cast<int>(err)));
 
 	srtp_policy_t outbound = {};
-	srtp_crypto_policy_set_from_profile_for_rtp(&outbound.rtp, srtpProfile);
-	srtp_crypto_policy_set_from_profile_for_rtcp(&outbound.rtcp, srtpProfile);
+	if (srtp_crypto_policy_set_from_profile_for_rtp(&outbound.rtp, srtpProfile))
+		throw std::runtime_error("SRTP profile is not supported");
+	if (srtp_crypto_policy_set_from_profile_for_rtcp(&outbound.rtcp, srtpProfile))
+		throw std::runtime_error("SRTP profile is not supported");
+
 	outbound.ssrc.type = ssrc_any_outbound;
 	outbound.key = mIsClient ? mClientSessionKey.data() : mServerSessionKey.data();
 	outbound.window_size = 1024;
@@ -327,6 +372,21 @@ void DtlsSrtpTransport::postHandshake() {
 
 	mInitDone = true;
 }
+
+#if !USE_GNUTLS && !USE_MBEDTLS
+DtlsSrtpTransport::ProfileParams DtlsSrtpTransport::getProfileParamsFromName(string_view name) {
+	if (name == "SRTP_AES128_CM_SHA1_80")
+		return {srtp_profile_aes128_cm_sha1_80, SRTP_AES_128_KEY_LEN, SRTP_SALT_LEN};
+	if (name == "SRTP_AES128_CM_SHA1_32")
+		return {srtp_profile_aes128_cm_sha1_32, SRTP_AES_128_KEY_LEN, SRTP_SALT_LEN};
+	if (name == "SRTP_AEAD_AES_128_GCM")
+		return {srtp_profile_aead_aes_128_gcm, SRTP_AES_128_KEY_LEN, SRTP_AEAD_SALT_LEN};
+	if (name == "SRTP_AEAD_AES_256_GCM")
+		return {srtp_profile_aead_aes_256_gcm, SRTP_AES_256_KEY_LEN, SRTP_AEAD_SALT_LEN};
+
+	throw std::logic_error("Unknown SRTP profile name: " + std::string(name));
+}
+#endif
 
 } // namespace rtc::impl
 

@@ -67,9 +67,13 @@ struct WebSocket final : public Channel, public std::enable_shared_from_this<Web
 	std::atomic<State> state = State::Closed;
 
 private:
+	static certificate_ptr loadCertificate(const Configuration& config);
+
+	void scheduleConnectionTimeout();
+
 	const init_token mInitToken = Init::Instance().token();
 
-	const certificate_ptr mCertificate;
+	certificate_ptr mCertificate;
 	bool mIsSecure;
 
 	optional<string> mHostname; // for TLS SNI and Proxy

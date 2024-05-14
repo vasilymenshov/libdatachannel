@@ -21,7 +21,7 @@
 
 namespace rtc::impl {
 
-TcpServer::TcpServer(uint16_t port, const char* bindAddress) {
+TcpServer::TcpServer(uint16_t port, const char *bindAddress) {
 	PLOG_DEBUG << "Initializing TCP server";
 	listen(port, bindAddress);
 }
@@ -66,8 +66,12 @@ shared_ptr<TcpTransport> TcpServer::accept() {
 			socket_t incomingSock = ::accept(mSock, (struct sockaddr *)&addr, &addrlen);
 
 			if (incomingSock != INVALID_SOCKET) {
-				return std::make_shared<TcpTransport>(incomingSock, nullptr); // no state callback
-
+				try {
+					return std::make_shared<TcpTransport>(incomingSock, nullptr); // no state callback
+				} catch(const std::exception &e) {
+					PLOG_WARNING << e.what();
+					::closesocket(incomingSock);
+				}
 			} else if (sockerrno != SEAGAIN && sockerrno != SEWOULDBLOCK) {
 				PLOG_ERROR << "TCP server failed, errno=" << sockerrno;
 				throw std::runtime_error("TCP server failed");
@@ -89,7 +93,7 @@ void TcpServer::close() {
 	}
 }
 
-void TcpServer::listen(uint16_t port, const char* bindAddress) {
+void TcpServer::listen(uint16_t port, const char *bindAddress) {
 	PLOG_DEBUG << "Listening on port " << port;
 
 	struct addrinfo hints = {};

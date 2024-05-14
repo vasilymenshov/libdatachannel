@@ -18,11 +18,11 @@ namespace rtc {
 // RTP configuration used in packetization process
 class RTC_CPP_EXPORT RtpPacketizationConfig {
 public:
-	const SSRC ssrc;
-	const std::string cname;
-	const uint8_t payloadType;
-	const uint32_t clockRate;
-	const uint8_t videoOrientationId;
+	SSRC ssrc;
+	std::string cname;
+	uint8_t payloadType;
+	uint32_t clockRate;
+	uint8_t videoOrientationId;
 
 	// current sequence number
 	uint16_t sequenceNumber;
@@ -53,6 +53,22 @@ public:
 	///   3 - 270 degrees
 	uint8_t videoOrientation = 0;
 
+	// MID Extension Header
+	uint8_t midId = 0;
+	optional<std::string> mid;
+
+	// RID Extension Header
+	uint8_t ridId = 0;
+	optional<std::string> rid;
+
+	// the negotiated ID of the playout delay header extension
+	// https://webrtc.googlesource.com/src/+/main/docs/native-code/rtp-hdrext/playout-delay/README.md
+	uint8_t playoutDelayId;
+
+	// Minimum/maxiumum playout delay, in 10ms intervals. A value of 10 would equal a 100ms delay
+	uint16_t playoutDelayMin;
+	uint16_t playoutDelayMax;
+
 	/// Construct RTP configuration used in packetization process
 	/// @param ssrc SSRC of source
 	/// @param cname CNAME of source
@@ -82,15 +98,6 @@ public:
 	/// Convert seconds to timestamp
 	/// @param seconds Number of seconds
 	uint32_t secondsToTimestamp(double seconds);
-
-	// deprecated, do not use
-	double startTime = 0.;
-	enum class EpochStart : uint64_t {
-		T1970 = 2208988800, // number of seconds between 1970 and 1900
-		T1900 = 0
-	};
-	[[deprecated]] void setStartTime(double startTime, EpochStart epochStart,
-	                                 optional<uint32_t> startTimestamp = std::nullopt);
 };
 
 } // namespace rtc

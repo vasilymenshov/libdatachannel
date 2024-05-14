@@ -13,9 +13,9 @@
 
 #include <climits>
 #include <limits>
-#include <list>
 #include <map>
 #include <random>
+#include <stdexcept>
 #include <vector>
 
 namespace rtc::impl::utils {
@@ -33,12 +33,6 @@ string base64_encode(const binary &data);
 
 // Return a random seed sequence
 std::seed_seq random_seed();
-
-// Parse an http message into lines
-size_t parseHttpLines(const byte *buffer, size_t size, std::list<string> &lines);
-
-// Parse headers of a http message
-std::multimap<string, string> parseHttpHeaders(const std::list<string> &lines);
 
 template <typename Generator, typename Result = typename Generator::result_type>
 struct random_engine_wrapper {
@@ -66,6 +60,28 @@ template <typename Generator = std::mt19937> auto random_bytes_engine() {
 	static_assert(char_independent_bits_engine::max() == std::numeric_limits<uint8_t>::max());
 	return random_engine<char_independent_bits_engine, uint8_t>();
 }
+
+template <typename T> uint16_t to_uint16(T i) {
+	if (i >= 0 && static_cast<typename std::make_unsigned<T>::type>(i) <=
+	                  std::numeric_limits<uint16_t>::max())
+		return static_cast<uint16_t>(i);
+	else
+		throw std::invalid_argument("Integer out of range");
+}
+
+template <typename T> uint32_t to_uint32(T i) {
+	if (i >= 0 && static_cast<typename std::make_unsigned<T>::type>(i) <=
+	                  std::numeric_limits<uint32_t>::max())
+		return static_cast<uint32_t>(i);
+	else
+		throw std::invalid_argument("Integer out of range");
+}
+
+namespace this_thread {
+
+void set_name(const string &name);
+
+} // namespace this_thread
 
 } // namespace rtc::impl::utils
 
